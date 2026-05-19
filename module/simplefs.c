@@ -225,21 +225,35 @@ static int simplefs_fill_super(struct super_block *sb, void *data, int silent)
     sb_set_blocksize(sb, 4096);
 
     bh = sb_bread(sb, sb_first_offset);
-    if (!bh) return -EIO;
+    if (!bh) {
+        printk(KERN_ERR "SimpleFS: Failed to read primary SB at block       %d\n", sb_first_offset);
+        return -EIO;
+    }
 
     disk_sb = (struct simplefs_super_block *)bh->b_data;
     calc_hash = kernel_calculate_hash(disk_sb);
 
     if (le32_to_cpu(disk_sb->magic) != SIMPLEFS_MAGIC || le32_to_cpu(disk_sb->hash) != calc_hash) {
         brelse(bh);
+        printk(KERN_WARNING "SimpleFS: Primary SB corrupted. Trying backup at block %d...\n", sb_second_offset);
+        
         bh = sb_bread(sb, sb_second_offset);
-        if (!bh) return -EIO;
+        if (!bh) {
+            printk(KERN_ERR "SimpleFS: Failed to read secondary SB at block %d\n", sb_second_offset);
+            return -EIO;
+        }
+        
         disk_sb = (struct simplefs_super_block *)bh->b_data;
         calc_hash = kernel_calculate_hash(disk_sb);
+        
         if (le32_to_cpu(disk_sb->magic) != SIMPLEFS_MAGIC || le32_to_cpu(disk_sb->hash) != calc_hash) {
             brelse(bh);
+            printk(KERN_ERR "SimpleFS: Both SBs corrupted or invalid!\n");
             return -EINVAL;
         }
+        printk(KERN_INFO "SimpleFS: Recovered using secondary SB.\n");
+    } else {
+        printk(KERN_INFO "SimpleFS: Mounted using primary SB.\n");
     }
 
     sb->s_magic = SIMPLEFS_MAGIC;
