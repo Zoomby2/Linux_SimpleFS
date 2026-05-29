@@ -127,25 +127,32 @@ static ssize_t simplefs_read(struct file *file, char __user *buf, size_t len, lo
     struct super_block *sb = inode->i_sb;
     struct buffer_head *bh;
     int file_idx = inode->i_ino - 2;
-    long long block = sb_second_offset + 1 + (file_idx * max_file_sectors) + (*ppos / sb->s_blocksize);
-    int offset = *ppos % sb->s_blocksize;
-    size_t bytes;
+    size_t bytes_read = 0;
 
     if (*ppos >= inode->i_size) return 0;
     if (*ppos + len > inode->i_size) len = inode->i_size - *ppos;
 
-    bytes = min((size_t)(sb->s_blocksize - offset), len);
-    bh = sb_bread(sb, block);
-    if (!bh) return -EIO;
+    /* цикл чтения, корректно обрабатывающий многоблочные запросы */
+    while (bytes_read < len) {
+        long long block = sb_second_offset + 1 + (file_idx * max_file_sectors) + ((*ppos + bytes_read) / sb->s_blocksize);
+        int offset = (*ppos + bytes_read) % sb->s_blocksize;
+        size_t avail = sb->s_blocksize - offset;
+        size_t chunk = min((size_t)(len - bytes_read), avail);
 
-    if (copy_to_user(buf, bh->b_data + offset, bytes)) {
+        bh = sb_bread(sb, block);
+        if (!bh) return bytes_read ? bytes_read : -EIO;
+
+        if (copy_to_user(buf + bytes_read, bh->b_data + offset, chunk)) {
+            brelse(bh);
+            return -EFAULT;
+        }
+
         brelse(bh);
-        return -EFAULT;
+        bytes_read += chunk;
     }
 
-    brelse(bh);
-    *ppos += bytes;
-    return bytes;
+    *ppos += bytes_read;
+    return bytes_read;
 }
 
 /* Запись пользовательских данных на виртуальный диск */
@@ -155,35 +162,65 @@ static ssize_t simplefs_write(struct file *file, const char __user *buf, size_t 
     struct super_block *sb = inode->i_sb;
     struct buffer_head *bh;
     int file_idx = inode->i_ino - 2;
-    long long block = sb_second_offset + 1 + (file_idx * max_file_sectors) + (*ppos / sb->s_blocksize);
-    int offset = *ppos % sb->s_blocksize;
-    size_t bytes;
+    size_t bytes_written = 0;
 
     if (*ppos >= inode->i_size) return -ENOSPC;
     if (*ppos + len > inode->i_size) len = inode->i_size - *ppos;
 
-    bytes = min((size_t)(sb->s_blocksize - offset), len);
-    bh = sb_bread(sb, block);
-    if (!bh) return -EIO;
+    while (bytes_written < len) {
+        long long block = sb_second_offset + 1 + (file_idx * max_file_sectors) + ((*ppos + bytes_written) / sb->s_blocksize);
+        int offset = (*ppos + bytes_written) % sb->s_blocksize;
+        size_t avail = sb->s_blocksize - offset;
+        size_t chunk = min((size_t)(len - bytes_written), avail);
 
-    if (copy_from_user(bh->b_data + offset, buf, bytes)) {
+        bh = sb_bread(sb, block);
+        if (!bh) return bytes_written ? bytes_written : -EIO;
+
+        if (copy_from_user(bh->b_data + offset, buf + bytes_written, chunk)) {
+            brelse(bh);
+            return -EFAULT;
+        }
+
+        mark_buffer_dirty(bh);
+        sync_dirty_buffer(bh);
         brelse(bh);
-        return -EFAULT;
+        bytes_written += chunk;
     }
 
-    mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
-    brelse(bh);
-    *ppos += bytes;
-    return bytes;
+    *ppos += bytes_written;
+    return bytes_written;
 }
 
-/* Набор стандартных файловых операций */
 const struct file_operations simplefs_file_operations = {
     .read       = simplefs_read,
     .write      = simplefs_write,
     .unlocked_ioctl = simplefs_ioctl,
     .llseek     = generic_file_llseek,
+};
+
+/* Перехват изменения атрибутов для предотвращения усечения размера файлов */
+static int simplefs_file_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
+{
+    struct inode *inode = d_inode(dentry);
+    int error;
+
+    error = setattr_prepare(idmap, dentry, attr);
+    if (error)
+        return error;
+
+    /* Если VFS пытается обнулить/изменить размер файла (флаг ATTR_SIZE), 
+     * убираем этот флаг, сохраняя фиксированный размер файла на диске */
+    if (attr->ia_valid & ATTR_SIZE) {
+        attr->ia_valid &= ~ATTR_SIZE;
+    }
+
+    setattr_copy(idmap, inode, attr);
+    return 0;
+}
+
+/* Операции над иннодами регулярных файлов */
+static const struct inode_operations simplefs_file_inode_operations = {
+    .setattr = simplefs_file_setattr,
 };
 
 /* Обход содержимого каталога при вызове просмотра директории */
@@ -234,6 +271,7 @@ static struct dentry *simplefs_lookup(struct inode *dir, struct dentry *dentry, 
     inode->i_ino = idx + 2;
     inode->i_mode = S_IFREG | 0666;
     inode->i_fop = &simplefs_file_operations;
+    inode->i_op = &simplefs_file_inode_operations;
     inode->i_size = max_file_sectors * dir->i_sb->s_blocksize;
     insert_inode_hash(inode);
     d_add(dentry, inode);
