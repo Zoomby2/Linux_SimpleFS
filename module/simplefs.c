@@ -271,7 +271,7 @@ static struct dentry *simplefs_lookup(struct inode *dir, struct dentry *dentry, 
     inode->i_ino = idx + 2;
     inode->i_mode = S_IFREG | 0666;
     inode->i_fop = &simplefs_file_operations;
-    inode->i_op = &simplefs_file_inode_operations; /* Привязываем операции с setattr */
+    inode->i_op = &simplefs_file_inode_operations;
     inode->i_size = max_file_sectors * dir->i_sb->s_blocksize;
     insert_inode_hash(inode);
     d_add(dentry, inode);
